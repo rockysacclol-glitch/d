@@ -1385,7 +1385,65 @@ do
     local SC = CONFIG.Scripts
     local canRun = type(loadstring) == "function" and type(setfenv) == "function"
     local runningSB, runCount = {}, 0
+    local unanchoredParts, unanchoredCount, unanchoredSerial = {}, 0, 0
     local errs, logs = Scripts.errs, Scripts.logs
+
+    local function forgetUnanchored(inst)
+        if unanchoredParts[inst] then
+            unanchoredParts[inst] = nil
+            unanchoredCount = math.max(0, unanchoredCount - 1)
+        end
+    end
+
+    local function trackUnanchored(sb, inst)
+        if not inst or not inst.Parent then return end
+        if not unanchoredParts[inst] then
+            while unanchoredCount >= 100 do
+                local oldest, oldestOrder
+                for part, record in pairs(unanchoredParts) do
+                    if not part.Parent then oldest, oldestOrder = part, -math.huge break end
+                    if not oldestOrder or record.order < oldestOrder then oldest, oldestOrder = part, record.order end
+                end
+                if not oldest then break end
+                local record = unanchoredParts[oldest]
+                forgetUnanchored(oldest)
+                if record and record.sb then
+                    for i = #record.sb.createdParts, 1, -1 do
+                        if record.sb.createdParts[i] == oldest then
+                            table.remove(record.sb.createdParts, i)
+                            record.sb.ncreated = math.max(0, record.sb.ncreated - 1)
+                        end
+                    end
+                end
+                pcall(function() oldest:Destroy() end)
+            end
+            unanchoredSerial += 1
+            unanchoredParts[inst] = { sb = sb, order = unanchoredSerial }
+            unanchoredCount += 1
+        end
+    end
+
+    local function makeLocalSound(sb, parent, assetId, volume, speed, looped)
+        local id = tostring(assetId or ""):match("%d+")
+        if not id or #id > 15 then error("PlaySound needs a numeric Roblox sound ID", 3) end
+        if not isPlayerInPlot(sb.plot) then error("script is outside its plot", 3) end
+        local sound = Instance.new("Sound")
+        sound.Name = "NBS_ScriptSound"
+        sound.SoundId = "rbxassetid://" .. id
+        sound.Volume = math.clamp(tonumber(volume) or 0.5, 0, 1)
+        sound.PlaybackSpeed = math.clamp(tonumber(speed) or 1, 0.25, 3)
+        sound.Looped = looped == true
+        sound:SetAttribute("NBS", true)
+        sound.Parent = parent or sb.part
+        sound:Play()
+        return {
+            Stop = function() pcall(function() sound:Stop() end) end,
+            Play = function() if sound.Parent then sound:Play() end end,
+            Destroy = function() pcall(function() sound:Stop() sound:Destroy() end) end,
+            SetVolume = function(_, value) sound.Volume = math.clamp(tonumber(value) or 0.5, 0, 1) end,
+            IsPlaying = function() return sound.Parent ~= nil and sound.IsPlaying end,
+        }
+    end
     Scripts.canRun = canRun
     Scripts.running = runningSB
 
@@ -1477,6 +1535,17 @@ do
         Reflectance = { g = function(i) return i.Reflectance end, s = function(i, v) i.Reflectance = num01(v) end },
         CanCollide = { g = function(i) return i.CanCollide end,
             s = function(i, v) assert(type(v) == "boolean", "CanCollide must be a boolean") i.CanCollide = v end },
+        Anchored = { g = function(i) return i.Anchored end },
+        Velocity = { g = function(i) return i.AssemblyLinearVelocity end,
+            s = function(i, v)
+                assert(okV3(v), "Velocity must be a Vector3")
+                i.AssemblyLinearVelocity = Vector3.new(math.clamp(v.X, -200, 200), math.clamp(v.Y, -200, 200), math.clamp(v.Z, -200, 200))
+            end },
+        AngularVelocity = { g = function(i) return i.AssemblyAngularVelocity end,
+            s = function(i, v)
+                assert(okV3(v), "AngularVelocity must be a Vector3")
+                i.AssemblyAngularVelocity = Vector3.new(math.clamp(v.X, -40, 40), math.clamp(v.Y, -40, 40), math.clamp(v.Z, -40, 40))
+            end },
         Name = { g = function(i) return i.Name end },
     }
 
@@ -1608,8 +1677,12 @@ do
 
         local function destroyFn()
             if created and inst.Parent then
+                forgetUnanchored(inst)
                 inst:Destroy()
                 sb.ncreated -= 1
+                for i = #sb.createdParts, 1, -1 do
+                    if sb.createdParts[i] == inst then table.remove(sb.createdParts, i) end
+                end
             end
         end
 
@@ -1624,6 +1697,11 @@ do
                 return sigs[k]
             end
             if k == "Tween" then return tweenFn end
+            if k == "PlaySound" then
+                return function(_, assetId, volume, speed, looped)
+                    return makeLocalSound(sb, inst, assetId, volume, speed, looped)
+                end
+            end
             if k == "Id" then return inst:GetAttribute("NB") end
             if k == "Fire" then
                 return function(_, eventName, ...)
@@ -1640,6 +1718,20 @@ do
             return nil
         end
         mt.__newindex = function(_, k, v)
+            if k == "Anchored" then
+                if not created then error("only parts created by Create() can be unanchored", 2) end
+                if type(v) ~= "boolean" then error("Anchored must be a boolean", 2) end
+                if not isPlayerInPlot(sb.plot) then error("script is outside its plot", 2) end
+                if not v then
+                    if not insidePlotPart(inst.Position, inst.Size, plots[sb.plot]) then error("part is outside this plot", 2) end
+                    trackUnanchored(sb, inst)
+                    inst.Anchored = false
+                else
+                    forgetUnanchored(inst)
+                    inst.Anchored = true
+                end
+                return
+            end
             local p = PROPS[k]
             if p and p.s then
                 if not isPlayerInPlot(sb.plot) then error("script is outside its plot", 2) end
@@ -1906,6 +1998,9 @@ do
             sb.lastNote = os.clock()
             toast("[Script] " .. tostring(text):sub(1, 60))
         end
+        env.PlaySound = function(assetId, volume, speed, looped)
+            return makeLocalSound(sb, sb.part, assetId, volume, speed, looped)
+        end
         env.Create = function(class, props)
             if not isPlayerInPlot(sb.plot) then error("script is outside its plot", 2) end
             if not CREATE[class] then error("Create: class must be Block, Ball, Cylinder or Wedge", 2) end
@@ -1923,6 +2018,7 @@ do
             end
             if not insidePlotPart(p.Position, p.Size, plots[sb.plot]) then sb.ncreated -= 1 p:Destroy() error("created part would leave this plot", 2) end
             p.Parent = sb.folder
+            sb.createdParts[#sb.createdParts + 1] = p
             local px = partProxy(sb, p, true)
             if type(props) == "table" then
                 for k, v in pairs(props) do px[k] = v end
@@ -2099,7 +2195,7 @@ do
         local sb = {
             id = id, src = src, part = i.part, plot = i.plot, kind = i.kind, mdl = i.mdl, alive = true,
             conns = {}, nconn = 0, thr = {}, nthr = 0, tweens = {}, ntw = 0, proxies = {},
-            eventHandlers = {}, nerr = 0, ncreated = 0, lastNote = 0, lastTp = 0,
+            eventHandlers = {}, createdParts = {}, nerr = 0, ncreated = 0, lastNote = 0, lastTp = 0,
         }
         sb.folder = Instance.new("Folder")
         sb.folder.Name = "NBS_" .. id
@@ -2160,6 +2256,10 @@ do
             if th ~= curTh then pcall(task.cancel, th) end
         end
         sb.restore()
+        for inst in pairs(unanchoredParts) do
+            local record = unanchoredParts[inst]
+            if record and record.sb == sb then forgetUnanchored(inst) end
+        end
         pcall(function() sb.folder:Destroy() end)
         if sb.kind == "model" then
             for _, m in ipairs(modelMembers(sb.mdl)) do
@@ -2488,41 +2588,35 @@ TEMPLATES = {
     { "Disco tile", SCR.disco }, { "Reset pad", SCR.resetpad }, { "Ghost wall", SCR.ghost },
 }
 
-API_TEXT = [[Your script runs on every client that has scripts enabled. Sandboxed - no game, no services, no HTTP.
+API_TEXT = [[Your script runs locally on each client with scripts enabled. Sandboxed - no game, services, or HTTP.
 
 script.Parent  -  the part (proxy)
   .Id .Position .Size .CFrame .Orientation .Color
-  .Material .Transparency .Reflectance .CanCollide
+  .Material .Transparency .Reflectance .CanCollide .Anchored .Velocity .AngularVelocity
   :Tween({Position = v3}, time, style, dir)
+  :PlaySound(soundId, volume, speed, looped)
   .Touched:Connect(function(player) end)
   .Clicked:Connect(function(player) end)
 Heartbeat:Connect(function(dt) end)
 Input.KeyPressed:Connect(function(keyName) end)
 Input.IsKeyDown("W")
-LocalPlayer / player:
+LocalPlayer:
   :GetPosition()  :Teleport(v3)
   :SetWalkSpeed(n)  :SetJumpPower(n)  :ResetStats()
-  (only work within 40 studs of the part)
 Create("Block"|"Ball"|"Cylinder"|"Wedge", {Position = ...})
+  createdPart.Anchored = false  -- real physics; max 100 unanchored parts globally
+PlaySound(soundId, volume, speed, looped)  -- local sound on script.Parent
 getPart(id)   notify("text")   print(...)
 getPart(id):Fire("Clicked") or firePart(id, "Clicked")
-Use the ID shown in the Script editor to target another part.
 Music.Play(index)   Music.Next()   Music.Stop()
 Music.SetVolume(0 to 1)   Music.GetCurrent()
 task.wait / task.spawn / task.delay
 
-MODEL scripts (select a model > Model code):
-  script.Parent is the model:  .Position  .Count  :GetParts()
-  :Move(v3)   :Tween({Position = v3}, time)
-  .Touched / .Clicked fire for any part of the model
-PLOT scripts (Plot code button) run for the whole plot:
-  script.Parent is nil.  World.SetClockTime(0-24)
-  World.SetBrightness(n)  SetFogEnd(n)  SetFogStart(n)  SetGravity(n)
-  World.SetFogColor(c)  SetAmbient(c)  SetOutdoorAmbient(c)
-  World.GetClockTime()  World.GetCenter()  World.Reset()
+MODEL scripts: script.Parent is the model: .Position .Count :GetParts() :Move(v3)
+PLOT scripts: script.Parent is nil; World.SetClockTime(), SetBrightness(), SetGravity(), etc.
 math string table os.time Vector3 CFrame Color3 Enum Random
 
-Limits: 1500 chars, loops must call wait(), 16 connections, 12 threads, 30 created parts.]]
+Limits: loops must call wait(); 100 unanchored parts total; created parts and threads are limited by the script settings.]]
 
 function P(c, s, o)
     o = o or {}
@@ -4897,7 +4991,7 @@ end
 
 do
     local rec, sc = makePanel("ScriptEditor", 430, 520, Vector2.new(0.5, 0.5), UDim2.fromScale(0.5, 0.5),
-        Vector2.new(0, 28), "Script", "LocalScript that runs on the selected part", function() toggleScript(false) end)
+        Vector2.new(0, 28), "Script", "Local script with physics, local sounds and code suggestions", function() toggleScript(false) end)
     scrRec = rec
     cur = sc
     orderN = 0
@@ -4906,18 +5000,32 @@ do
     Size = UDim2.new(1, 0, 0, 270),
     BackgroundColor3 = Color3.fromRGB(25, 28, 35),
     BorderSizePixel = 0,
+    ClipsDescendants = false,
     LayoutOrder = nextO()
 }, cur)
 
 corner(holder, 8)
 stroke(holder, C.line, 1)
 
+local codeScroll = new("ScrollingFrame", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 6,
+    ScrollBarImageColor3 = C.edge,
+    CanvasSize = UDim2.new(0, 0, 0, 270),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    Active = true,
+    ScrollingDirection = Enum.ScrollingDirection.Y
+}, holder)
+
 srcBox = new("TextBox", {
-    Size = UDim2.new(1, -12, 1, -10),
-    Position = UDim2.fromOffset(6, 5),
+    Size = UDim2.new(1, -16, 0, 270),
+    Position = UDim2.fromOffset(8, 5),
+    AutomaticSize = Enum.AutomaticSize.Y,
     BackgroundTransparency = 1,
     Text = "",
-    PlaceholderText = "local part = script.Parent\npart.Clicked:Connect(function()\n    notify(\"Button pressed\")\nend)",
+    PlaceholderText = "local part = script.Parent\\npart.Clicked:Connect(function()\\n    notify(\\"Button pressed\\")\\nend)",
     MultiLine = true,
     TextWrapped = false,
     ClearTextOnFocus = false,
@@ -4925,8 +5033,108 @@ srcBox = new("TextBox", {
     TextSize = 13,
     TextColor3 = Color3.fromRGB(225, 230, 240),
     TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top
+    TextYAlignment = Enum.TextYAlignment.Top,
+    ZIndex = 2
+}, codeScroll)
+
+local completion = new("Frame", {
+    Position = UDim2.new(1, -190, 1, -126),
+    Size = UDim2.fromOffset(180, 116),
+    BackgroundColor3 = Color3.fromRGB(34, 39, 49),
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 20
 }, holder)
+corner(completion, 7)
+stroke(completion, C.accent, 1)
+new("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, completion)
+
+local completionItems = {
+    "Anchored", "CanCollide", "Position", "Size", "CFrame", "Orientation", "Color", "Velocity", "AngularVelocity",
+    "Transparency", "Material", "Touched", "Clicked", "Tween", "PlaySound", "Create",
+    "Heartbeat", "Input", "LocalPlayer", "Vector3.new", "CFrame.new", "Color3.fromRGB",
+    "math", "task.wait", "task.spawn", "notify", "getPart", "Music.Play", "Enum.Material",
+    "part.Anchored", "part.CanCollide", "part.Position", "part.Size", "part.CFrame", "part.Velocity",
+    "part.Touched", "part.Clicked", "part:Tween", "part:PlaySound", "part:Destroy",
+    "LocalPlayer:GetPosition", "LocalPlayer:Teleport", "LocalPlayer:SetWalkSpeed",
+    "LocalPlayer:SetJumpPower", "function", "local", "if", "then", "else", "for", "while", "return", "end"
+}
+
+local function hideCompletion()
+    completion.Visible = false
+    for _, child in ipairs(completion:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+end
+
+local function acceptCompletion(value, token)
+    local text = srcBox.Text
+    local cursor = srcBox.CursorPosition
+    if cursor < 1 then cursor = #text + 1 end
+    local before = text:sub(1, cursor - 1)
+    local after = text:sub(cursor)
+    local tokenStart = #before - #token + 1
+    srcBox.Text = before:sub(1, tokenStart - 1) .. value .. after
+    srcBox.CursorPosition = tokenStart + #value
+    srcBox:CaptureFocus()
+    hideCompletion()
+end
+
+local function updateCompletion()
+    if not srcBox:IsFocused() then hideCompletion() return end
+    local cursor = srcBox.CursorPosition
+    if cursor < 1 then hideCompletion() return end
+    local before = srcBox.Text:sub(1, cursor - 1)
+    local token = before:match("[%w_%.:]+$") or ""
+    if #token < 2 then hideCompletion() return end
+    local matches = {}
+    local lower = token:lower()
+    for _, item in ipairs(completionItems) do
+        if item:lower():sub(1, #lower) == lower then
+            matches[#matches + 1] = item
+            if #matches >= 5 then break end
+        end
+    end
+    hideCompletion()
+    for index, item in ipairs(matches) do
+        local option = new("TextButton", {
+            Size = UDim2.new(1, -8, 0, 20),
+            BackgroundColor3 = Color3.fromRGB(43, 51, 64),
+            BorderSizePixel = 0,
+            Text = item,
+            TextColor3 = C.ink,
+            Font = Enum.Font.Code,
+            TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            LayoutOrder = index,
+            ZIndex = 21
+        }, completion)
+        connect(option.MouseButton1Click, function() acceptCompletion(item, token) end)
+    end
+    completion.Visible = #matches > 0
+end
+
+connect(srcBox:GetPropertyChangedSignal("Text"), updateCompletion)
+connect(srcBox:GetPropertyChangedSignal("CursorPosition"), updateCompletion)
+connect(srcBox.Focused, updateCompletion)
+connect(srcBox.FocusLost, hideCompletion)
+connect(UIS.InputBegan, function(input)
+    if input.KeyCode == Enum.KeyCode.Tab and srcBox:IsFocused() and completion.Visible then
+        local first, firstOrder
+        for _, child in ipairs(completion:GetChildren()) do
+            if child:IsA("TextButton") and (not firstOrder or child.LayoutOrder < firstOrder) then
+                first, firstOrder = child, child.LayoutOrder
+            end
+        end
+        if first then
+            local cursor = srcBox.CursorPosition
+            local before = srcBox.Text:sub(1, math.max(0, cursor - 1))
+            local token = before:match("[%w_%.:]+$") or ""
+            acceptCompletion(first.Text, token)
+        end
+    end
+end)
+
 
 info = label(cur, "", {
     Size = UDim2.new(1, 0, 0, 30),
