@@ -14,7 +14,7 @@ CONFIG = {
     PollInterval = 5,
     FlushInterval = 1.2,
     MaxChunksPerFlush = 6,
-    MaxPartsPerUser = 1500,
+    MaxPartsPerUser = 150000,
     MaxDecals = 6,
     MaxFx = 6,
     ToggleKey = Enum.KeyCode.RightShift,
@@ -43,14 +43,14 @@ CONFIG = {
     },
 
     Scripts = {
-        MaxSource = 1500,
-        MaxRunning = 40,
-        MaxConnections = 16,
-        MaxThreads = 12,
-        MaxCreated = 30,
-        MaxErrors = 20,
-        ProximityLimit = 40,
-        MaxPlotScripts = 4,
+        MaxSource = 15000000,
+        MaxRunning = 400,
+        MaxConnections = 1600,
+        MaxThreads = 1200,
+        MaxCreated = 3000,
+        MaxErrors = 2000,
+        ProximityLimit = 400,
+        MaxPlotScripts = 400,
     },
 
     Sounds = {
